@@ -4,6 +4,48 @@
 - `requirements-myo.txt` – install from this
 - `requirements-original-conda.txt` – authors' conda export, reference only
 
+## Changes from the original `realtime.py`
+
+### Compatibility (required to run on current Python / Bleak)
+- Updated to the current Bleak API (`BleakScanner.discover`, `disconnected_callback`,
+  `is_connected` property); removed calls dropped in newer Bleak versions
+- Replaced `asyncio.sleep(..., loop=loop)` and the manual event loop with `asyncio.run()`;
+  `nest_asyncio` no longer needed
+- Device search matches `MYO_NAME` instead of the hardcoded name `"Cyclops"`,
+  prints all found devices and retries instead of crashing
+
+### Bug fixes
+- Live prediction stored standardized EMG in an integer array, truncating values to
+  whole numbers; now float32, matching the fine-tuning preprocessing
+- Live loop re-subscribed to EMG notifications endlessly; now subscribes once
+
+### Fine-tuning
+- Recording per gesture: 1.6 s → 6.4 s (`SAMPLES_PER_GESTURE = 40 * window`)
+- Batch size 2 → 32 (BatchNorm needs reasonable batch statistics)
+- Learning rate 0.0002 → 0.001, up to 60 epochs with early stopping
+  (patience 10, best weights restored)
+- Proper validation: last 20% of each gesture held out, with a gap so overlapping
+  windows don't leak between train and validation
+- Prints a confusion matrix (true vs. predicted gesture) after training
+- Default gestures: Rest, Fist, Open Hand, Ok Sign, Wrist Flexion, Wrist Extension
+  (Thumbs Up removed: indistinguishable from Fist for a forearm armband)
+
+### Live recognition
+- Majority-vote smoothing over the last 5 predictions
+- Prints only when the recognized gesture changes
+- Calls the model directly instead of `model.predict()` (lower latency)
+
+### Other
+- Sends the Myo "never sleep" command so the armband doesn't disconnect during training
+- Saves the raw recording to `finetune_recording.npy` for later analysis
+- Restructured as a linear script: scan → record → fine-tune → live
+
+## Other file changes
+- `config.py`: `filters = [32, 64]` to match the bundled checkpoint (was `[48, 96]`, which failed to load)
+- `requirements-myo.txt`: working environment (Python 3.9, TF 2.9.1, current Bleak)
+- `requirements-original.txt`: authors' conda export, reference only
+- `realtime_original.py`: authors' original, reference only
+
 ## [IEEE NER 2023 - EffiE: Efficient Convolutional Neural Network for Real-Time EMG Pattern Recognition System on Edge Devices](https://ieeexplore.ieee.org/document/10123741/)
 
 ![Fine-Tuning](visuals/finetune.png?raw=true "Fine-Tuning")
