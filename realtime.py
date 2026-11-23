@@ -29,8 +29,8 @@ delay = 2.0                          # seconds to get into the pose before recor
 val_fraction = 0.2
 
 realtime_batch_size = 32
-realtime_epochs = 120
-finetune_lr = 0.0001
+realtime_epochs = 100
+finetune_lr = 0.001
 SMOOTHING = 5                        # majority vote over last N predictions
 
 finetuned_path = "finetuned/checkpoint.ckpt"   # set to None to skip saving

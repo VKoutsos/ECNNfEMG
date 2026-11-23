@@ -1,8 +1,31 @@
+# ECNNfEMG: Real-time EMG Gesture Recognition with the Myo Armband
+
+Real-time hand gesture classification from the Thalmic Myo armband, based on the EffiE
+project (IEEE NER 2023, SF State MIC Lab): a CNN pretrained on NinaPro DB5 and fine-tuned
+on each user's own short recording.
+
+## Setup (Windows)
+```
+conda create -n myo python=3.9
+conda activate myo
+pip install -r requirements-myo.txt
+```
+`requirements-original.txt` is the authors' Windows conda export, kept for reference only.
+
+## Running
+1. Bluetooth on in Windows, but **don't pair** the Myo in Windows settings. Close Myo Connect.
+2. Wake the armband and put it on near the elbow.
+3. `python realtime.py`: at **"Get ready: X"** go into the pose and hold it until
+   "Done, relax." After fine-tuning it prints a confusion matrix and starts live recognition.
+
+Recording protocol: forearm and elbow resting on the table, same palm orientation for every
+gesture, moderate steady force, same posture for recording and live use.
+
 ## Files
-- `realtime.py` – patched version, use this
-- `realtime_original.py` – authors' original, kept for reference (needs bleak 0.15 / Python ≤3.9)
-- `requirements-myo.txt` – install from this
-- `requirements-original-conda.txt` – authors' conda export, reference only
+- `realtime.py`: patched version, use this
+- `realtime_original.py`: authors' original, kept for reference (needs bleak 0.15 / Python ≤3.9)
+- `requirements-myo.txt`: install from this
+- `requirements-original.txt`: authors' conda export, reference only
 
 ## Changes from the original `realtime.py`
 
@@ -22,13 +45,13 @@
 ### Fine-tuning
 - Recording per gesture: 1.6 s → 6.4 s (`SAMPLES_PER_GESTURE = 40 * window`)
 - Batch size 2 → 32 (BatchNorm needs reasonable batch statistics)
-- Learning rate 0.0002 → 0.001, up to 60 epochs with early stopping
-  (patience 10, best weights restored)
+- Learning rate 0.0002 → 0.001, up to 100 epochs with early stopping (patience 10;
+  in TF 2.9 the best weights are only restored if early stopping actually triggers)
 - Proper validation: last 20% of each gesture held out, with a gap so overlapping
   windows don't leak between train and validation
 - Prints a confusion matrix (true vs. predicted gesture) after training
-- Default gestures: Rest, Fist, Open Hand, Ok Sign, Wrist Flexion, Wrist Extension
-  (Thumbs Up removed: indistinguishable from Fist for a forearm armband)
+- Default gestures: Rest, Fist, Open Hand, Wrist Flexion, Wrist Extension
+  (Thumbs Up removed: hard to distinguish from Fist for a forearm armband)
 
 ### Live recognition
 - Majority-vote smoothing over the last 5 predictions
@@ -41,10 +64,28 @@
 - Restructured as a linear script: scan → record → fine-tune → live
 
 ## Other file changes
-- `config.py`: `filters = [32, 64]` to match the bundled checkpoint (was `[48, 96]`, which failed to load)
+- `config.py`: `filters = [32, 64]` to match the bundled checkpoint (was `[48, 96]`,
+  which failed to load)
 - `requirements-myo.txt`: working environment (Python 3.9, TF 2.9.1, current Bleak)
 - `requirements-original.txt`: authors' conda export, reference only
 - `realtime_original.py`: authors' original, reference only
+
+## Credits and license
+Based on **EffiE: Efficient Convolutional Neural Network for Real-Time EMG Pattern Recognition
+System on Edge Devices** (IEEE NER 2023), SF State MIC Lab:
+https://github.com/MIC-Laboratory/IEEE-NER-2023-EffiE
+
+Pretraining data: **NinaPro DB5** (https://ninapro.hevs.ch/instructions/DB5.html).
+If you use it, cite: Pizzolato et al., "Comparison of six electromyography acquisition setups
+on hand movement classification tasks", PLOS One, 2017.
+
+---
+
+# Original EffiE README
+
+> Kept unchanged for reference and credit. Parts are outdated for this fork:
+> install from `requirements-myo.txt` (not `requirements.txt`), and the reported 89%
+> accuracy comes from a train/test split with data leakage.
 
 ## [IEEE NER 2023 - EffiE: Efficient Convolutional Neural Network for Real-Time EMG Pattern Recognition System on Edge Devices](https://ieeexplore.ieee.org/document/10123741/)
 
