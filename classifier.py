@@ -74,12 +74,24 @@ def replay_arrays(session, spans):
     return emg, truth
 
 
-def finetune(Xtr, ytr, Xva, yva, n_classes, lr=0.001, epochs=60, batch=32, patience=10):
+def finetune(Xtr, ytr, Xva, yva, n_classes, lr=0.001, epochs=100, batch=32, patience=10,
+             balance=True):
     model = get_finetune(config.save_path, config.prev_params, lr=lr, num_classes=n_classes)
+    # recompile so weighted validation data also gets a weighted accuracy (no warnings)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+                  loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"], weighted_metrics=["accuracy"])
+    cw = None
+    if balance:
+        # weight each gesture equally, regardless of how many windows it has
+        counts = np.bincount(ytr, minlength=n_classes)
+        cw = {c: len(ytr) / (n_classes * max(n, 1)) for c, n in enumerate(counts)}
+    # validation gets the same weights, so early stopping also treats gestures equally
+    val = (Xva, yva, np.array([cw[c] for c in yva])) if cw else (Xva, yva)
     early = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience,
                                              restore_best_weights=True)
-    model.fit(Xtr, ytr, validation_data=(Xva, yva), batch_size=batch, epochs=epochs,
-              shuffle=True, callbacks=[early], verbose=2)
+    model.fit(Xtr, ytr, validation_data=val, batch_size=batch, epochs=epochs,
+              shuffle=True, callbacks=[early], class_weight=cw, verbose=2)
     return model
 
 
@@ -95,8 +107,9 @@ def confusion(model, X, y, gestures):
         acc = cm[i, i] / max(cm[i].sum(), 1)
         print(f"  {g:16s}" + "".join(f"{v:9d}" for v in cm[i]) + f"   {acc:.0%}")
     overall = float(np.trace(cm) / max(cm.sum(), 1))
-    print(f"  Overall: {overall:.1%}")
-    return cm, overall
+    balanced = float(np.mean(np.diag(cm) / np.maximum(cm.sum(axis=1), 1)))
+    print(f"  Overall: {overall:.1%}   Balanced (mean per gesture): {balanced:.1%}")
+    return cm, overall, balanced
 
 
 def save_model(model, folder, gestures):

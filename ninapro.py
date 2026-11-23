@@ -60,4 +60,4 @@ def load_subject(db5_root, subject, gestures, myo="elbow", min_len=64):
     t = np.arange(len(emg)) / FS
     meta = dict(participant=f"DB5_s{subject}", source=f"NinaPro DB5 {fname}",
                 myo=myo, gestures=list(gestures))
-    return Session(emg.astype(np.float32), t, events, meta)
+    return Session(emg.astype(np.float32), t, events, meta)     
