@@ -1,356 +1,189 @@
 """
-@original author: Amir Modan
-@editor: Jimmy L. @ SF State MIC Lab
- - Date: Summer 2022
-
-Main Program for Real-Time system which establishes BLE connection,
-    defines GUI, and finetunes realtime samples from a pretrained finetune-base model.
-    
-Flow: (running via Async Functions)
-    1. Run the code (python realtime.py)
-    2. Enable bluetooth in setting, and code with automatically pair with armband
-    3. Follow instructions to perform gestures for finetuning
-    4. Finetune training starts
-        - Optional: save finetuned-model
-    5. Real time gesture recognition begins
-
-Note:
-    1. Should see myo armband in blue lighting if connected.
-    2. Run this on Linux if possible, sometimes Bleak refuses to connect to Myo Armband under Windows environment.
+Real-time Myo gesture recognition (patched EffiE realtime.py)
+Original: Amir Modan, Jimmy L. @ SF State MIC Lab
+Patched for current Bleak / Python 3.9+, with preprocessing and fine-tuning fixes.
 """
-
 import asyncio
 import json
-import random
-import config
-import nest_asyncio
-nest_asyncio.apply()
-import tensorflow as tf
+import os
+from collections import Counter, deque
+
 import numpy as np
-import warnings
-from typing import Any
-from bleak import BleakClient, discover
+import tensorflow as tf
+from bleak import BleakClient, BleakScanner
+
+import config
 from dataset import realtime_preprocessing
-from model import get_finetune, realtime_pred
+from model import get_finetune
 
+tf.get_logger().setLevel("ERROR")
 
-warnings.filterwarnings("ignore")
-tf.get_logger().setLevel('INFO')
+# ---------------- Settings ----------------
+MYO_NAME = "Myo"                     # part of your armband's BLE name (see scan output)
+GESTURES = ["Rest", "Fist", "Open Hand", "Wrist Flexion", "Wrist Extension"]
 
-# UUID's for BLE Connection
+window = 32                          # must match config.window (pretrained input size)
+step_size = 10                       # live prediction every 10 samples = 50 ms
+SAMPLES_PER_GESTURE = 40 * window    # 1280 samples ~ 6.4 s per gesture
+delay = 2.0                          # seconds to get into the pose before recording
+val_fraction = 0.2
 
+realtime_batch_size = 32
+realtime_epochs = 120
+finetune_lr = 0.0001
+SMOOTHING = 5                        # majority vote over last N predictions
+
+finetuned_path = "finetuned/checkpoint.ckpt"   # set to None to skip saving
+recording_path = "finetune_recording.npy"      # raw EMG, channels x samples
+
+# Myo BLE UUIDs
 CONTROL = "d5060401-a904-deb9-4748-2c7f4a124842"
-EMG0 = "d5060105-a904-deb9-4748-2c7f4a124842"
-EMG1 = "d5060205-a904-deb9-4748-2c7f4a124842"
-EMG2 = "d5060305-a904-deb9-4748-2c7f4a124842"
-EMG3 = "d5060405-a904-deb9-4748-2c7f4a124842"
-
-# Batch size for realtime fine-tuning
-realtime_batch_size = 2
-
-# Epoch for realtime fine-tuning
-realtime_epochs = 15
-
-# Samples window
-window = 32
-
-# Step Size
-step_size = 10
-
-# Samples to be recored for each gesture
-SAMPLES_PER_GESTURE = 10 * window
-
-# List of Gestures to be used for classification
-
-GESTURES = [
-    "Rest", "Fist", "Thumbs Up", "Ok Sign"
+EMG_CHARS = [
+    "d5060105-a904-deb9-4748-2c7f4a124842",
+    "d5060205-a904-deb9-4748-2c7f4a124842",
+    "d5060305-a904-deb9-4748-2c7f4a124842",
+    "d5060405-a904-deb9-4748-2c7f4a124842",
 ]
 
-delay = 2.0
-
-# Number of sensors Myo Armband contains
-num_sensors = 8
-
-# Path to save finetuned model, set NONE if no export
-# finetuned_path = None
-finetuned_path = "finetuned/checkpoint.ckpt"
-
-# 2D list to store realtime training data
-sensors = [[] for i in range(num_sensors)]
-
-# Bluetooth device for Myo Armband
-selected_device = []
-
-# Load MEAN and Standard Deviation for Standarization from Ninapro DB5 sEMG signals.
-with open(config.std_mean_path, 'r') as f:
+with open(config.std_mean_path) as f:
     params = json.load(f)
 
-    
-class Connection:
-    
-    client: BleakClient = None
-    
-    def __init__(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        EMG0: str,
-        EMG1: str,
-        EMG2: str,
-        EMG3: str,
-        CONTROL: str,
-    ):
-        self.loop = loop
-        self.EMG0 = EMG0 # MyoCharacteristic0
-        self.EMG1 = EMG1 # MyoCharacteristic1
-        self.EMG2 = EMG2 # MyoCharacteristic2
-        self.EMG3 = EMG3 # MyoCharacteristic3
-        self.CONTROL = CONTROL
-        self.connected = False
-        self.connected_device = None
-        self.model = get_finetune(config.save_path, config.prev_params, lr=0.0002, num_classes=len(GESTURES))
-        self.current_sample = [[] for i in range(num_sensors)]
-        
-        self.count = 0
 
-    """
-        Handler for when BLE device is disconnected
-    
-    """
-    def on_disconnect(self, client: BleakClient):
-        self.connected = False
-        print(f"Disconnected from {self.connected_device.name}!")
+def decode(payload):
+    """One notification = 2 consecutive samples x 8 channels, signed int8."""
+    vals = np.frombuffer(bytes(payload[:16]), dtype=np.int8).astype(np.float32)
+    return vals[:8], vals[8:]
 
-    """
-        Callback right after BLE device is deisconnected
-    
-    """
-    async def cleanup(self):
-        # Terminates all communication attempts with BLE device
-        if self.client:
-            await self.client.stop_notify(EMG0)
-            await self.client.stop_notify(EMG1)
-            await self.client.stop_notify(EMG2)
-            await self.client.stop_notify(EMG3)
-            await self.client.disconnect()
 
-    """
-        Searches for nearby BLE devices or initiates connection with BLE device if chosen
-    """
-    
-    async def manager(self):
-        print("Starting connection manager.")
-        while True:
-            if self.client:
-                await self.connect()
-            else:
-                await self.select_device()
-                await asyncio.sleep(1.0, loop=loop)       
-    
-    """
-        Performs initial actions on connection with BLE device, including training neural network
-    
-    """
-    async def connect(self):
-        if self.connected:
-            return
-        try: 
-            # Stopped Here
-            await asyncio.sleep(0.01, loop=loop)
-            await self.client.connect()
+async def find_myo():
+    while True:
+        print("Scanning for Myo...")
+        devices = await BleakScanner.discover(timeout=5.0)
+        for d in devices:
+            if d.name:
+                print("  found:", d.name, d.address)
+        for d in devices:
+            if d.name and MYO_NAME.lower() in d.name.lower():
+                return d
+        print("Myo not found. Is it charged, awake, and not connected elsewhere? Retrying...\n")
 
-            self.connected = await self.client.is_connected()
-            if self.connected:
-                print(F"Connected to {self.connected_device.name}")
-                self.client.set_disconnected_callback(self.on_disconnect)
-                
-                # Must send below command to Myo Armband to initiate EMG communication
-                bytes_to_send = bytearray([1, 3, 2, 0, 0])
-                await connection.client.write_gatt_char(CONTROL, bytes_to_send)
-                
-                # Loops through each gesture and collects training data
-                for gesture in GESTURES:
-                    
-                    # Notify User to begin performing current gesture
-                    print("Begining to Perform " + gesture)
-                    
-                    initial_length = len(sensors[0])
-                    
-                    # Generate slight delay to allow time for user to perform next gesture
-                    await asyncio.sleep(delay, loop=loop)
-                    
-                    # Notify User Myo Armband is currently collecting signals
-                    print("Perform " + gesture + " Now!\n")
-                    
-                    # Begin collecting training data
-                    await self.client.start_notify(self.EMG0, self.training_handler)
-                    await self.client.start_notify(self.EMG1, self.training_handler)
-                    await self.client.start_notify(self.EMG2, self.training_handler)
-                    await self.client.start_notify(self.EMG3, self.training_handler)
-                    
-                    # Continue until enough data is collected
-                    while((len(sensors[0])-initial_length) < SAMPLES_PER_GESTURE):
-                        await asyncio.sleep(0.05, loop=loop)
-                        
-                    # Stop collecting training data
-                    await self.client.stop_notify(EMG0)
-                    await self.client.stop_notify(EMG1)
-                    await self.client.stop_notify(EMG2)
-                    await self.client.stop_notify(EMG3)
-                    
-                    # If some channels sent more data than others,
-                    # discards extra data so all channels have the same amount of data
-                    for channel_idx, sensor_samples in enumerate(sensors):
-                        sensors[channel_idx] = sensor_samples[:(SAMPLES_PER_GESTURE+initial_length)]
-                
-                # Get preprocessed data for training
-                inputs, outputs = realtime_preprocessing(sensors, params_path=config.std_mean_path,
-                                                         num_classes=len(GESTURES), window=window, step=step_size)
-                
-                # Perform cross-validation sampling ([label 0, label 1, label 2, label 3, label 0, label 1, label 2, label 3, ...])
-                sampled_inputs = []
-                sampled_outputs = []
 
-                clusters = len(inputs) // len(GESTURES)
-                for idx in range(clusters):
-                    for labels in range(len(GESTURES)):
-                        sampled_inputs.append(inputs[idx+(labels*clusters)])
-                        sampled_outputs.append(outputs[idx+(labels*clusters)])
+async def record(client):
+    data = [[] for _ in range(8)]  # channels-first
 
-                sampled_inputs = np.array(sampled_inputs)
-                sampled_outputs = np.array(sampled_outputs)
-                
-                # Convert data to appropriate sEMG images. (For example: [batch_size, 1, 8(sensors/channels), 52(window size)])
-                sampled_inputs = sampled_inputs.reshape(-1, 8, window, 1)
-                
-                # Optional cast data to float 32
-                sampled_inputs = sampled_inputs.astype(np.float32)
-                
-                # Train model
-                self.model.fit(
-                    sampled_inputs,
-                    sampled_outputs,
-                    batch_size=realtime_batch_size,
-                    epochs=realtime_epochs
-                )
-                if finetuned_path != None:
-                    self.model.save_weights(finetuned_path)
-                
-                # Predict gestures until network is disconnected
-                
-                while True:
-                    if not self.connected:
-                        break
-                    await self.client.start_notify(self.EMG0, self.prediction_handler)
-                    await self.client.start_notify(self.EMG1, self.prediction_handler)
-                    await self.client.start_notify(self.EMG2, self.prediction_handler)
-                    await self.client.start_notify(self.EMG3, self.prediction_handler)
-                    
-                    
-            else:
-                print(f"Failed to connect to {self.connected_device.name}")
-        except Exception as e:
-            print(e)
+    def handler(_, payload):
+        s1, s2 = decode(payload)
+        for ch in range(8):
+            data[ch].append(s1[ch])
+            data[ch].append(s2[ch])
 
-    """
-        Selects and connects to a BLE device
-    
-    """
-    async def select_device(self):
-        print("Bluetooh LE hardware warming up...")
-        await asyncio.sleep(2.0, loop=loop)
-        #Searches for BLE devices
-        devices = await discover()
-       
-        response = None
-        for i, device in enumerate(devices):
-            if device.name == "Cyclops":
-                response = i
-        
-        if response == None:
-            print("Could not find myo armband. Please Try Again.")
-            self.cleanup()
-                
-        print(f"Connecting to {devices[response].name}")
-        self.connected_device = devices[response]
-        self.client = BleakClient(devices[response].address, loop=self.loop)
-    
+    for gesture in GESTURES:
+        start = len(data[0])
+        print(f"\nGet ready: {gesture}  (go into the pose NOW and hold it)")
+        await asyncio.sleep(delay)
+        print(f"Recording {gesture}...")
+        for c in EMG_CHARS:
+            await client.start_notify(c, handler)
+        while len(data[0]) - start < SAMPLES_PER_GESTURE:
+            await asyncio.sleep(0.05)
+        for c in EMG_CHARS:
+            await client.stop_notify(c)
+        await asyncio.sleep(0.2)  # let in-flight notifications arrive before trimming
+        for ch in range(8):
+            data[ch] = data[ch][:start + SAMPLES_PER_GESTURE]
+        print("Done, relax.")
+    return data
 
-    # Handler for collecting 2 Sequential Sequence from Myo Armaband (MyoCharacteristics0)
-    # Each Sequential Sequence contains 1 sample from each 8 sensors/channels
-    def training_handler(self, sender: str, data: Any):
-        sequence_1, sequence_2 = getFeatures(data, twos_complement=True)
-        for channel_idx in range(8):
-            sensors[channel_idx].append(sequence_1[channel_idx])
-            sensors[channel_idx].append(sequence_2[channel_idx])
-  
-  
-    # Handler for collecting 2 Sequential Sequence from Myo Armaband
-    # Each Sequential Sequence contains 1 sample from each 8 sensors/channels
-    async def prediction_handler(self, sender: str, data: Any):
-        sequence_1, sequence_2 = getFeatures(data, twos_complement=True)
-        for channel_idx in range(8):
-            self.current_sample[channel_idx].append(sequence_1[channel_idx])
-            self.current_sample[channel_idx].append(sequence_2[channel_idx])
-        
-        if len(self.current_sample[0]) >= window:
-            # Truncate self.current_samples to window size
-            sEMG = np.array([samples[-window:] for samples in self.current_sample])
-            
-            # Apply Standarization to sEMG data
-            for channel_idx in range(len(sEMG)):
-                mean = params[str(channel_idx)][0]
-                std = params[str(channel_idx)][1]
-                sEMG[channel_idx] = (sEMG[channel_idx] - mean) / std
-            
-            # Optional cast input to float 32 (demand of microcontroller)
-            sEMG = sEMG.astype(np.float32)
-            
-            # Get prediction results
-            pred = realtime_pred(
-                self.model,
-                sEMG,
-                num_channels=num_sensors,
-                window_length=window
-            )
-            
-            
-            # Update prediction results
-            print(GESTURES[pred])
-            
-            # Remove first 8 instance from self.current_samples to collect new data. (overlaps)
-            self.current_sample = [samples[-(window-step_size):] for samples in self.current_sample]
-            
 
-def getFeatures(data, twos_complement=True):
-    sequence_1 = []
-    sequence_2 = []
-    for i in range(8):
-        if twos_complement==True and data[i] > 127:
-            sequence_1.append(data[i]-256)
-        else:
-            sequence_1.append(data[i])
-            
-    for i in range(8,16):
-        if twos_complement==True and data[i] > 127:
-            sequence_2.append(data[i]-256)
-        else:
-            sequence_2.append(data[i])
+def finetune(data):
+    inputs, y = realtime_preprocessing(
+        data, params_path=config.std_mean_path,
+        num_classes=len(GESTURES), window=window, step=step_size,
+    )
+    X = inputs.reshape(-1, 8, window, 1).astype(np.float32)
 
-    return sequence_1, sequence_2
+    # Validation = last 20% of each gesture's recording, with a gap so
+    # overlapping windows don't leak between train and validation.
+    gap = window // step_size + 1
+    tr, va = [], []
+    for c in range(len(GESTURES)):
+        idx = np.where(y == c)[0]
+        cut = int(len(idx) * (1 - val_fraction))
+        tr.extend(idx[:cut - gap])
+        va.extend(idx[cut:])
+    tr, va = np.array(tr), np.array(va)
 
-#############
-# App Main
-#############
+    model = get_finetune(config.save_path, config.prev_params,
+                         lr=finetune_lr, num_classes=len(GESTURES))
+
+     # Stop when val_loss hasn't improved for 10 epochs, keep the best weights
+    early = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=10, restore_best_weights=True
+    )
+    model.fit(X[tr], y[tr], validation_data=(X[va], y[va]),
+              batch_size=realtime_batch_size, epochs=realtime_epochs,
+              shuffle=True, callbacks=[early])
+
+    # Confusion matrix: rows = true gesture, columns = predicted
+    pred = np.argmax(model.predict(X[va], verbose=0), axis=1)
+    print("\nValidation (rows = true gesture, columns = predicted):")
+    print(" " * 16 + "".join(f"{g[:8]:>9s}" for g in GESTURES))
+    for c, g in enumerate(GESTURES):
+        m = y[va] == c
+        counts = [np.sum(pred[m] == k) for k in range(len(GESTURES))]
+        print(f"  {g:14s}" + "".join(f"{n:9d}" for n in counts) + f"   {np.mean(pred[m] == c):.0%}")
+
+    if finetuned_path:
+        os.makedirs(os.path.dirname(finetuned_path), exist_ok=True)
+        model.save_weights(finetuned_path)
+    return model
+
+
+async def live(client, model):
+    buf = [[] for _ in range(8)]
+    recent = deque(maxlen=SMOOTHING)
+    last = None
+
+    def handler(_, payload):
+        nonlocal buf, last
+        s1, s2 = decode(payload)
+        for ch in range(8):
+            buf[ch].append(s1[ch])
+            buf[ch].append(s2[ch])
+        if len(buf[0]) >= window:
+            x = np.array([b[-window:] for b in buf], dtype=np.float32)  # float32 fix
+            for ch in range(8):
+                mean, std = params[str(ch)]
+                x[ch] = (x[ch] - mean) / std
+            probs = model(x.reshape(1, 8, window, 1), training=False).numpy()[0]
+            recent.append(int(np.argmax(probs)))
+            pred = Counter(recent).most_common(1)[0][0]
+            if pred != last:
+                print("->", GESTURES[pred])
+                last = pred
+            buf = [b[-(window - step_size):] for b in buf]
+
+    for c in EMG_CHARS:
+        await client.start_notify(c, handler)
+    print("\nLive recognition running. Ctrl+C to stop.")
+    while client.is_connected:
+        await asyncio.sleep(0.1)
+
+
+async def main():
+    device = await find_myo()
+    async with BleakClient(device, disconnected_callback=lambda _: print("Disconnected!")) as client:
+        print("Connected to", device.name)
+        await client.write_gatt_char(CONTROL, bytearray([0x09, 0x01, 0x01]))              # never sleep
+        await client.write_gatt_char(CONTROL, bytearray([0x01, 0x03, 0x02, 0x00, 0x00]))  # start EMG
+        data = await record(client)
+        np.save(recording_path, np.array(data, dtype=np.float32))
+        model = finetune(data)
+        await live(client, model)
+
+
 if __name__ == "__main__":
-
-    # Create the event loop.
-    loop = asyncio.get_event_loop()
-    connection = Connection(loop, EMG0, EMG1, EMG2, EMG3, CONTROL) # EMG3
     try:
-        asyncio.ensure_future(connection.manager())
-        loop.run_forever()
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("User stopped program.")
-    finally:
-        print("Disconnecting...")
-        loop.run_until_complete(connection.cleanup())
+        print("Stopped.")

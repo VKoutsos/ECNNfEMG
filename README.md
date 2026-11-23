@@ -1,3 +1,9 @@
+## Files
+- `realtime.py` – patched version, use this
+- `realtime_original.py` – authors' original, kept for reference (needs bleak 0.15 / Python ≤3.9)
+- `requirements-myo.txt` – install from this
+- `requirements-original-conda.txt` – authors' conda export, reference only
+
 ## [IEEE NER 2023 - EffiE: Efficient Convolutional Neural Network for Real-Time EMG Pattern Recognition System on Edge Devices](https://ieeexplore.ieee.org/document/10123741/)
 
 ![Fine-Tuning](visuals/finetune.png?raw=true "Fine-Tuning")
