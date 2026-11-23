@@ -1,50 +1,154 @@
-## Files
-- `realtime.py` – patched version, use this
-- `realtime_original.py` – authors' original, kept for reference (needs bleak 0.15 / Python ≤3.9)
-- `requirements-myo.txt` – install from this
-- `requirements-original-conda.txt` – authors' conda export, reference only
+# ECNNfEMG: Real-time EMG Gesture Recognition with the Myo Armband
 
-## Changes from the original `realtime.py`
+Real-time hand gesture classification from the Thalmic Myo armband (8 EMG channels, 200 Hz),
+built on the EffiE project (IEEE NER 2023, SF State MIC Lab): a small CNN pretrained on
+NinaPro DB5 and fine-tuned on each user's own short recording.
 
-### Compatibility (required to run on current Python / Bleak)
-- Updated to the current Bleak API (`BleakScanner.discover`, `disconnected_callback`,
-  `is_connected` property); removed calls dropped in newer Bleak versions
-- Replaced `asyncio.sleep(..., loop=loop)` and the manual event loop with `asyncio.run()`;
-  `nest_asyncio` no longer needed
-- Device search matches `MYO_NAME` instead of the hardcoded name `"Cyclops"`,
-  prints all found devices and retries instead of crashing
+Part of our Cybathlon project. Later stages will add sonomyography (ultrasound) and muscle
+fatigue assessment; the pipeline is structured with that in mind.
 
-### Bug fixes
-- Live prediction stored standardized EMG in an integer array, truncating values to
-  whole numbers; now float32, matching the fine-tuning preprocessing
-- Live loop re-subscribed to EMG notifications endlessly; now subscribes once
+## Setup (Windows)
+```
+conda create -n myo python=3.9
+conda activate myo
+pip install -r requirements-myo.txt
+```
+`requirements-original.txt` is the authors' Windows conda export, kept for reference only.
+Don't install from it.
 
-### Fine-tuning
-- Recording per gesture: 1.6 s → 6.4 s (`SAMPLES_PER_GESTURE = 40 * window`)
-- Batch size 2 → 32 (BatchNorm needs reasonable batch statistics)
-- Learning rate 0.0002 → 0.001, up to 60 epochs with early stopping
-  (patience 10, best weights restored)
-- Proper validation: last 20% of each gesture held out, with a gap so overlapping
-  windows don't leak between train and validation
-- Prints a confusion matrix (true vs. predicted gesture) after training
-- Default gestures: Rest, Fist, Open Hand, Ok Sign, Wrist Flexion, Wrist Extension
-  (Thumbs Up removed: indistinguishable from Fist for a forearm armband)
+If `conda` isn't recognised in PowerShell / VS Code, run once (then restart VS Code):
+```
+C:\Users\<you>\miniconda3\Scripts\conda.exe init powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
 
-### Live recognition
-- Majority-vote smoothing over the last 5 predictions
-- Prints only when the recognized gesture changes
-- Calls the model directly instead of `model.predict()` (lower latency)
+**NinaPro DB5:** needed for replay mode and benchmarks. Unzip the subject archives into
+`Ninapro_DB5/s1 … s10` (only these folders inside `Ninapro_DB5/`).
 
-### Other
-- Sends the Myo "never sleep" command so the armband doesn't disconnect during training
-- Saves the raw recording to `finetune_recording.npy` for later analysis
-- Restructured as a linear script: scan → record → fine-tune → live
+## Quick start
 
-## Other file changes
-- `config.py`: `filters = [32, 64]` to match the bundled checkpoint (was `[48, 96]`, which failed to load)
-- `requirements-myo.txt`: working environment (Python 3.9, TF 2.9.1, current Bleak)
-- `requirements-original.txt`: authors' conda export, reference only
-- `realtime_original.py`: authors' original, reference only
+### With the armband
+1. Bluetooth on in Windows, but **don't pair** the Myo in Windows settings. Close Myo Connect.
+   The USB dongle is not used.
+2. Wake the armband and put it on (near the elbow, same position every time).
+3. Record, fine-tune and go live:
+   ```
+   python run_live.py --participant <name>
+   ```
+   3 rounds × 6 gestures × 4 s (~2.5 min). At **"Get ready: X"** go into the pose and hold it
+   until "Done, relax." Everything is saved to `sessions/<date>_<name>/`.
+4. Reuse a saved model without recording:
+   ```
+   python run_live.py --load sessions/<folder>
+   ```
+
+### Without the armband
+```
+python run_live.py --ninapro 1 --speed 4      # DB5 subject 1 as a stand-in user
+python run_live.py --replay sessions/<folder> # re-fine-tune on a saved session
+python benchmark.py                           # CNN vs LDA over all DB5 subjects
+```
+
+### Main options (`run_live.py`)
+| Option | Default | Meaning |
+|---|---|---|
+| `--gestures` | Rest, Fist, Open Hand, Ok Sign, Wrist Flexion, Wrist Extension | Gesture list (Rest first) |
+| `--rounds` / `--hold` | 3 / 4.0 s | Recording rounds and seconds per gesture |
+| `--threshold` | 0.6 | Below this confidence the output is Rest (avoids false triggers) |
+| `--smoothing` | 5 | Majority vote over the last N predictions |
+| `--speed` | 1.0 | Replay speed |
+| `--myo-name` | Myo | Part of the armband's Bluetooth name |
+
+## Recording protocol
+- Forearm **and elbow resting on the table**, hand past the edge, shoulder relaxed
+- **Same palm orientation for every gesture** (we use palm sideways / thumb up)
+- Moderate, steady force; Rest = hand fully limp
+- Wrist flexion/extension: only the wrist moves, fingers relaxed
+- Same posture for recording and live use
+
+## How it works
+1. **Pretrained model** (`checkpoints/model.ckpt`): the authors' CNN trained on NinaPro DB5.
+   Input: 160 ms windows (8 channels × 32 samples), standardised with `scaling_params.json`.
+2. **Fine-tuning:** the output layer is replaced to match our gesture list; all layers are
+   trained on the user's recording (LR 0.001, class-balanced, early stopping).
+   Validation = the last recording round.
+3. **Live:** a prediction every 50 ms; low-confidence predictions become Rest; majority vote
+   smooths the output.
+
+It is a classifier of static poses: it recognises *which* gesture is held, not how strongly.
+
+## Repository structure
+| File | Purpose |
+|---|---|
+| `run_live.py` | Main entry point: record / load / replay → fine-tune → live |
+| `myo_io.py` | EMG sources with one interface: real Myo (`MyoBLE`) or replay (`ReplayStream`); shared clock |
+| `recording.py` | Sessions (save/load), repeated-rounds protocol, import of old recordings |
+| `ninapro.py` | Loads one DB5 subject as a session |
+| `classifier.py` | Preprocessing, train/val split, fine-tuning, confusion matrix, live `Predictor` |
+| `features.py` | EMG features: MAV, RMS, WL, ZC, SSC; MNF/MDF for fatigue work |
+| `benchmark.py` | CNN vs LDA on all DB5 subjects, threshold comparison |
+| `realtime.py` | Earlier single-script version (one round, no sessions); still works |
+| `realtime_original.py` | Authors' original, reference only (needs Bleak 0.15 / Python ≤ 3.9) |
+| `model.py`, `dataset.py`, `train.py`, `config.py` | From the original repo (`config.py`: `filters = [32, 64]`) |
+| `tensorflow_lite.py` | Original TFLite export; has known issues, see below |
+| `requirements-myo.txt` | Our environment |
+| `requirements-original.txt` | Authors' conda export, reference only |
+| `CHANGELOG.md` | All changes compared to the original EffiE code |
+
+### Session format
+```
+sessions/<date>_<time>_<participant>/
+    emg.npy       (N, 8)  raw EMG, recorded continuously
+    t.npy         (N,)    timestamp per sample (epoch seconds, high resolution)
+    events.json   labelled segments: gesture, round, start/end sample, times
+    meta.json     participant, posture, gestures, settings
+    model/        fine-tuned weights + gesture list
+    results.json  validation confusion matrix and accuracy
+```
+`sessions/` is git-ignored (personal recordings). Benchmark results in `benchmarks/` are committed.
+
+## Changes from the original EffiE code
+See [CHANGELOG.md](CHANGELOG.md) for the full list. Main points: works with current
+Bleak / Python 3.9+, fixed integer truncation in live prediction, fixed checkpoint
+mismatch in `config.py`, repeated-rounds recording with proper validation, class
+balancing, confidence threshold, session logging, replay mode and DB5 benchmark.
+
+### Known issues in the original code (not fixed)
+Only relevant for retraining the base model (`train.py`) or TFLite export:
+- `train.py` shuffles individual samples before windowing, and train/test share recordings
+  (the reported 89% is optimistic)
+- `config.inital_lr = 0.2` is too high for Adam (use 0.001 before retraining)
+- `tensorflow_lite.py` has hardcoded sizes and overwrites `scaling_params.json`
+
+## Troubleshooting
+| Problem | Fix |
+|---|---|
+| `conda` not recognised | `conda.exe init powershell` + restart VS Code (see Setup) |
+| Myo not found | Charge/wake it, close Myo Connect, unpair in Windows, check `--myo-name` |
+| Shape mismatch loading checkpoint | `config.filters` must be `[32, 64]` |
+| CUDA / nvcuda.dll warnings | Harmless; runs on CPU |
+| Gesture often confused | Hold it more consistently, or choose a more distinct gesture |
+| Too many false triggers | Raise `--threshold` |
+| Output flickers | Raise `--smoothing` |
+
+## Credits and license
+Based on **EffiE: Efficient Convolutional Neural Network for Real-Time EMG Pattern Recognition
+System on Edge Devices** (IEEE NER 2023), SF State MIC Lab:
+https://github.com/MIC-Laboratory/IEEE-NER-2023-EffiE
+
+Pretraining data: **NinaPro DB5** (https://ninapro.hevs.ch/instructions/DB5.html).
+If you use it, cite: Pizzolato et al., "Comparison of six electromyography acquisition setups
+on hand movement classification tasks", PLOS One, 2017.
+
+---
+
+# Original EffiE README
+
+> Kept unchanged for reference and credit. Parts are outdated for this fork:
+> install from `requirements-myo.txt` (not `requirements.txt`), the main entry point is now
+> `run_live.py`, and the reported 89% accuracy comes from a train/test split with data
+> leakage (see "Known issues" above).
+
 
 ## [IEEE NER 2023 - EffiE: Efficient Convolutional Neural Network for Real-Time EMG Pattern Recognition System on Edge Devices](https://ieeexplore.ieee.org/document/10123741/)
 

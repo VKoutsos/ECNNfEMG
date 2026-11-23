@@ -4,3 +4,4 @@ numpy==1.23.1
 scipy==1.9.0
 matplotlib==3.5.2
 bleak==1.1.1
+scikit-learn=1.6.1

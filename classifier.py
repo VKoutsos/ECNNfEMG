@@ -75,7 +75,7 @@ def replay_arrays(session, spans):
 
 
 def finetune(Xtr, ytr, Xva, yva, n_classes, lr=0.001, epochs=100, batch=32, patience=10,
-             balance=True):
+             balance=True, verbose=2):
     model = get_finetune(config.save_path, config.prev_params, lr=lr, num_classes=n_classes)
     # recompile so weighted validation data also gets a weighted accuracy (no warnings)
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
@@ -91,7 +91,7 @@ def finetune(Xtr, ytr, Xva, yva, n_classes, lr=0.001, epochs=100, batch=32, pati
     early = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience,
                                              restore_best_weights=True)
     model.fit(Xtr, ytr, validation_data=val, batch_size=batch, epochs=epochs,
-              shuffle=True, callbacks=[early], class_weight=cw, verbose=2)
+              shuffle=True, callbacks=[early], class_weight=cw, verbose=verbose)
     return model
 
 
